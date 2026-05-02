@@ -6,12 +6,13 @@
 use std::fs::DirEntry;
 
 use clap::{crate_version, Command};
+use std::os::linux::fs::MetadataExt;
 use uucore::{error::UResult, format_usage, help_about, help_usage};
 
 const ABOUT: &str = help_about!("lsns.md");
 const USAGE: &str = help_usage!("lsns.md");
 const PATH_PROC: &str = "/proc";
-
+const LSNS_NETNS_UNUSABLE: i32 = -2;
 const NSNAMES: [&str; 8] = ["cgroup", "ipc", "mnt", "net", "pid", "user", "uts", "time"];
 
 enum NamespaceType {
@@ -45,6 +46,23 @@ struct Process {
     ns_oids: [u64; 8],
     // Network namespace ID - used by the network subsystem
     netnsid: i32,
+}
+
+impl Process {
+    /// Creates a new instance with the given PID
+    pub fn new() -> Self {
+        Self {
+            pid: 0,
+            ppid: 0,
+            tpid: 0,
+            state: ' ',
+            uid: 0,
+            ns_ids: [0; 8],
+            ns_pids: [0; 8],
+            ns_oids: [0; 8],
+            netnsid: 0,
+        }
+    }
 }
 
 struct Namespace {
@@ -82,18 +100,42 @@ pub fn uu_app() -> Command {
 
 fn read_processes(path: &str) -> std::io::Result<()> {
     for entry in std::fs::read_dir(path)? {
-        if entry.is_err() {
-            continue;
-        }
+        let _entry: DirEntry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
 
-        let pid: u64 = match get_pid_from_entry(&entry.as_ref().unwrap()) {
+        let pid: u64 = match get_pid_from_entry(&_entry) {
             Some(p) => p,
             None => continue,
         };
 
-        println!("PID: {}", pid);
+        let uid = match get_uid_from_entry(&_entry) {
+            Some(u) => u,
+            None => continue,
+        };
+
+        println!("PID:UID {}:{}", pid, uid);
+        println!("====================================");
     }
     Ok(())
+}
+
+// fn read_process(lsns: &mut Lsns, entry: &DirEntry) -> bool {
+//     let mut process = Process::new();
+
+//     process.netnsid = LSNS_NETNS_UNUSABLE;
+
+//     process.uid = match get_uid_from_entry(&entry) {
+//         Some(u) => u,
+//         None => return false,
+//     };
+// }
+
+fn get_uid_from_entry(entry: &DirEntry) -> Option<u32> {
+    let f = entry.metadata().ok()?;
+    let uid = f.st_uid();
+    Some(uid)
 }
 
 /// Check if a directory entry in /proc represents a process.
