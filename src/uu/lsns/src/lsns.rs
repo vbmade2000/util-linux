@@ -6,6 +6,8 @@
 use std::fs::DirEntry;
 
 use clap::{crate_version, Command};
+use std::fs;
+use std::io;
 use std::os::linux::fs::MetadataExt;
 use uucore::{error::UResult, format_usage, help_about, help_usage};
 
@@ -39,13 +41,14 @@ struct Process {
     // User ID - the user that owns this process
     uid: u32,
     // Namespace inode IDs for each namespace type
-    ns_ids: [u32; 8],
+    ns_ids: [u64; 8],
     // Parent namespace inode IDs (for hierarchical namespaces like pid, user)
     ns_pids: [u64; 8],
     // Owner namespace inode IDs (for user namespace)
     ns_oids: [u64; 8],
     // Network namespace ID - used by the network subsystem
     netnsid: i32,
+    ns_siblings: [Vec<String>; 8],
 }
 
 impl Process {
@@ -61,6 +64,7 @@ impl Process {
             ns_pids: [0; 8],
             ns_oids: [0; 8],
             netnsid: 0,
+            ns_siblings: Default::default(),
         }
     }
 }
@@ -115,7 +119,17 @@ fn read_processes(path: &str) -> std::io::Result<()> {
             None => continue,
         };
 
-        println!("PID:UID {}:{}", pid, uid);
+        let stat = match get_process_stat(&_entry) {
+            Some(s) => s,
+            None => continue,
+        };
+
+        let (pid, state, ppid) = match parse_process_stat(&stat) {
+            Some(s) => s,
+            None => continue,
+        };
+
+        println!("PID:UID:PPID:STATE {}:{}:{}:{}", pid, uid, ppid, state);
         println!("====================================");
     }
     Ok(())
@@ -131,6 +145,80 @@ fn read_processes(path: &str) -> std::io::Result<()> {
 //         None => return false,
 //     };
 // }
+
+fn get_process_stat(entry: &DirEntry) -> Option<String> {
+    let path = entry.path().join("stat");
+    Some(std::fs::read_to_string(&path).ok()?)
+}
+
+/// Parse /proc/[pid]/stat content to extract PID, state, and PPID
+///
+/// Format: PID (COMMAND) STATE PPID ...
+/// The command name can contain spaces and parentheses
+fn parse_process_stat(stat: &str) -> Option<(u32, char, u32)> {
+    // Find the last ')' - handles command names with parentheses
+    let rparen_pos = stat.rfind(')')?;
+
+    // Find the first '(' - marks start of command name
+    let lparen_pos = stat.find('(')?;
+
+    // Validate positions
+    if lparen_pos >= rparen_pos {
+        return None;
+    }
+
+    // Extract PID (everything before the '(')
+    let pid_str = stat[..lparen_pos].trim();
+    let pid: u32 = pid_str.parse().ok()?;
+
+    // Extract state and PPID (everything after the ')')
+    // Format after ')': " STATE PPID ..."
+    let after_paren = &stat[rparen_pos + 1..];
+    let mut parts = after_paren.split_whitespace();
+
+    // Get state (first field after ')')
+    let state_str = parts.next()?;
+    let state: char = state_str.chars().next()?;
+
+    // Get PPID (second field after ')')
+    let ppid_str = parts.next()?;
+    let ppid: u32 = ppid_str.parse().ok()?;
+
+    Some((pid, state, ppid))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_simple_stat() {
+        let stat = "1234 (bash) S 1200 1234 1234 34816 1500";
+        let result = parse_process_stat(stat);
+        assert_eq!(result, Some((1234, 'S', 1200)));
+    }
+
+    #[test]
+    fn test_parse_stat_with_parens_in_name() {
+        let stat = "5678 (my app (v2)) R 1 5678 5678";
+        let result = parse_process_stat(stat);
+        assert_eq!(result, Some((5678, 'R', 1)));
+    }
+
+    #[test]
+    fn test_parse_stat_with_spaces_in_name() {
+        let stat = "9999 (Google Chrome) S 1234 9999 9999";
+        let result = parse_process_stat(stat);
+        assert_eq!(result, Some((9999, 'S', 1234)));
+    }
+
+    #[test]
+    fn test_parse_invalid_stat() {
+        assert_eq!(parse_process_stat("invalid"), None);
+        assert_eq!(parse_process_stat("1234 bash S 1200"), None); // Missing parens
+        assert_eq!(parse_process_stat(""), None);
+    }
+}
 
 fn get_uid_from_entry(entry: &DirEntry) -> Option<u32> {
     let f = entry.metadata().ok()?;
@@ -165,4 +253,79 @@ fn get_pid_from_entry(entry: &DirEntry) -> Option<u64> {
     };
 
     Some(pid)
+}
+
+/// Get namespace inode numbers for a process
+///
+/// Reads /proc/[pid]/ns/[nsname] to get:
+/// - ino: The namespace's own inode
+/// - pino: Parent namespace inode (for hierarchical namespaces)
+/// - oino: Owner user namespace inode
+fn get_ns_inos(pid: i32, nsname: &str) -> Option<(u64, u64, u64)> {
+    let ns_path = format!("/proc/{}/ns/{}", pid, nsname);
+
+    // Get the namespace inode by stat'ing the namespace file
+    let metadata = fs::metadata(&ns_path).ok()?;
+    let ino = metadata.st_ino();
+
+    // For now, we don't get parent and owner inodes
+    // (requires ioctl NS_GET_PARENT and NS_GET_USERNS, which need unsafe code)
+    let pino = 0;
+    let oino = 0;
+
+    Some((ino, pino, oino))
+}
+
+/// Integration into read_process
+fn read_process(lsns: &mut Lsns, pid: i32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut process = Process::new();
+    process.pid = pid as u32;
+    process.netnsid = LSNS_NETNS_UNUSABLE;
+
+    // Get UID
+    let proc_path = format!("/proc/{}", pid);
+    if let Ok(metadata) = fs::metadata(&proc_path) {
+        process.uid = metadata.uid();
+    }
+
+    // Read and parse /proc/[pid]/stat
+    let stat_path = format!("/proc/{}/stat", pid);
+    if let Ok(stat_content) = fs::read_to_string(&stat_path) {
+        if let Some((pid, state, ppid)) = parse_process_stat(&stat_content) {
+            process.pid = pid;
+            process.state = state;
+            process.ppid = ppid;
+        }
+    }
+
+    // Get namespace inodes for all namespace types
+    // let ns_inodes = get_all_ns_inos(pid)?;
+
+    for (i, nsname) in NSNAMES.iter().enumerate() {
+        let (ino, pino, oino) = match get_ns_inos(pid, nsname) {
+            Some((i, p, o)) => (i, p, o),
+            None => continue,
+        };
+
+        process.ns_ids[i] = ino;
+        process.ns_pids[i] = pino;
+        process.ns_oids[i] = oino;
+    }
+
+    // for (i, inodes) in ns_inodes.iter().enumerate() {
+    //     process.ns_ids[i] = inodes.ino;
+    //     process.ns_pids[i] = inodes.pino;
+    //     process.ns_oids[i] = inodes.oino;
+    // }
+
+    // // Special handling for network namespace
+    // if process.ns_ids[3] != 0 { // LSNS_TYPE_NET = 3
+    //      // TODO: Get network namespace ID via netlink
+    //      // process.netnsid = get_netnsid_for_process(pid, process.ns_ids[3])?;
+    // }
+
+    lsns.processes.push(process);
+    true
 }
