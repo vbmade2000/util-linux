@@ -94,6 +94,7 @@ pub fn uumain(args: impl uucore::Args) -> UResult<()> {
         namespaces: Vec::new(),
     };
     read_processes(PATH_PROC, &mut lsns)?;
+    read_namespaces(&mut lsns);
     Ok(())
 }
 
@@ -280,6 +281,98 @@ fn read_process(entry: &DirEntry, pid: i32) -> Option<Process> {
 
     // TODO: Read opened namespaces. Check read_opened_namespaces function in lsns.c
     Some(process)
+}
+
+fn read_namespaces(lsns: &mut Lsns) {
+    read_assigned_namespaces(lsns);
+}
+
+/// Read and organize namespaces from the processes we've collected
+///
+/// This is Phase 2 of data collection:
+/// - Phase 1: read_processes() collected all process information
+/// - Phase 2: This function groups processes by their namespaces
+///
+/// What it does:
+/// 1. Iterates through all processes
+/// 2. For each namespace a process belongs to, creates a Namespace struct (if new)
+/// 3. Links processes to their namespaces
+/// 4. Counts processes per namespace
+fn read_assigned_namespaces(lsns: &mut Lsns) {
+    // We'll use a HashMap to track namespaces by inode for quick lookup
+    // Key: namespace inode, Value: index in lsns.namespaces vector
+    let mut namespace_map: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+
+    // Iterate through all processes we collected
+    for proc_idx in 0..lsns.processes.len() {
+        let process = &lsns.processes[proc_idx];
+
+        // For each of the 8 namespace types (mnt, net, pid, uts, ipc, user, cgroup, time)
+        for ns_type_idx in 0..8 {
+            // Get the namespace inode for this process and namespace type
+            let ns_inode = process.ns_ids[ns_type_idx];
+
+            // Skip if this process doesn't have this namespace type
+            // (inode = 0 means not present)
+            if ns_inode == 0 {
+                continue;
+            }
+
+            // Check if we've already created a Namespace struct for this inode
+            let ns_idx = if let Some(&idx) = namespace_map.get(&ns_inode) {
+                // Namespace already exists - use existing index
+                idx
+            } else {
+                // This is a new namespace - create it
+
+                // For network namespaces, use the network namespace ID we queried earlier
+                // For other types, mark as unusable (-2)
+                let netnsid = if ns_type_idx == 3 {
+                    // Index 3 = Net namespace
+                    process.netnsid
+                } else {
+                    LSNS_NETNS_UNUSABLE
+                };
+
+                // Create the new namespace
+                let namespace = Namespace {
+                    id: ns_inode as u32, // Cast to match your Namespace.id type
+                    ns_type: NamespaceType::from_index(ns_type_idx),
+                    nprocs: 0, // Will increment as we add processes
+                    netnsid,
+                };
+
+                // Add to our namespace list
+                let idx = lsns.namespaces.len();
+                lsns.namespaces.push(namespace);
+
+                // Remember this namespace's index for future lookups
+                namespace_map.insert(ns_inode, idx);
+
+                idx
+            };
+
+            // Now increment the process count for this namespace
+            lsns.namespaces[ns_idx].nprocs += 1;
+        }
+    }
+}
+
+/// Helper to convert namespace type index to enum
+impl NamespaceType {
+    fn from_index(idx: usize) -> Self {
+        match idx {
+            0 => NamespaceType::Cgroup,
+            1 => NamespaceType::Ipc,
+            2 => NamespaceType::Mnt,
+            3 => NamespaceType::Net,
+            4 => NamespaceType::Pid,
+            5 => NamespaceType::User,
+            6 => NamespaceType::Uts,
+            7 => NamespaceType::Time,
+            _ => panic!("Invalid namespace type index: {}", idx),
+        }
+    }
 }
 
 #[cfg(test)]
