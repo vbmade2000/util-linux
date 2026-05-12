@@ -7,7 +7,9 @@ use std::fs::DirEntry;
 
 use clap::{crate_version, Command};
 use std::fs;
+use std::io;
 use std::os::linux::fs::MetadataExt;
+use std::os::unix::io::AsRawFd;
 use uucore::{error::UResult, format_usage, help_about, help_usage};
 
 const ABOUT: &str = help_about!("lsns.md");
@@ -16,6 +18,7 @@ const PATH_PROC: &str = "/proc";
 const LSNS_NETNS_UNUSABLE: i32 = -2;
 const NSNAMES: [&str; 8] = ["cgroup", "ipc", "mnt", "net", "pid", "user", "uts", "time"];
 
+#[derive(Debug, Clone, Copy)]
 enum NamespaceType {
     Cgroup = 0,
     Ipc = 1,
@@ -48,6 +51,8 @@ struct Process {
     // Network namespace ID - used by the network subsystem
     netnsid: i32,
     ns_siblings: [Vec<String>; 8],
+    // Command name of the process
+    command: String,
 }
 
 impl Process {
@@ -64,6 +69,7 @@ impl Process {
             ns_oids: [0; 8],
             netnsid: 0,
             ns_siblings: Default::default(),
+            command: String::new(),
         }
     }
 }
@@ -77,6 +83,10 @@ struct Namespace {
     nprocs: u32,
     // Network namespace ID - used by the network subsystem
     netnsid: i32,
+    // Representative process (lowest PID) - used for display
+    representative_pid: Option<u32>,
+    // Fallback UID for namespaces without processes (persistent namespaces)
+    uid_fallback: u32,
 }
 
 struct Lsns {
@@ -88,13 +98,20 @@ struct Lsns {
 pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     let _matches = uu_app().try_get_matches_from(args)?;
 
-    println!("This is lsns utility");
     let mut lsns = Lsns {
         processes: Vec::new(),
         namespaces: Vec::new(),
     };
+
+    // Phase 1: Read all processes
     read_processes(PATH_PROC, &mut lsns)?;
+
+    // Phase 2: Organize into namespaces
     read_namespaces(&mut lsns);
+
+    // Phase 3: Display results
+    display_namespaces(&lsns);
+
     Ok(())
 }
 
@@ -237,6 +254,39 @@ fn get_ns_inos(pid: u32, nsname: &str) -> Option<(u64, u64, u64)> {
     Some((ino, pino, oino))
 }
 
+/// Get the command name for a process
+///
+/// Tries to read from /proc/[pid]/cmdline first (full command line),
+/// falls back to /proc/[pid]/comm (just the command name)
+fn get_process_command(pid: u32) -> String {
+    // Try cmdline first (full command with arguments)
+    let cmdline_path = format!("/proc/{}/cmdline", pid);
+    if let Ok(content) = fs::read(&cmdline_path) {
+        // cmdline uses null bytes as separators
+        if !content.is_empty() {
+            // Find the first null byte or use entire content
+            let end = content
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(content.len());
+            if end > 0 {
+                if let Ok(cmd) = String::from_utf8(content[..end].to_vec()) {
+                    return cmd;
+                }
+            }
+        }
+    }
+
+    // Fall back to comm (just the command name, max 16 chars)
+    let comm_path = format!("/proc/{}/comm", pid);
+    if let Ok(content) = fs::read_to_string(&comm_path) {
+        return content.trim().to_string();
+    }
+
+    // If both fail, return placeholder
+    String::from("?")
+}
+
 /// Integration into read_process
 fn read_process(entry: &DirEntry, pid: i32) -> Option<Process> {
     let mut process = Process::new();
@@ -260,8 +310,6 @@ fn read_process(entry: &DirEntry, pid: i32) -> Option<Process> {
     process.ppid = ppid;
 
     // Get namespace inodes for all namespace types
-    // let ns_inodes = get_all_ns_inos(pid)?;
-
     for (i, nsname) in NSNAMES.iter().enumerate() {
         let (ino, pino, oino) = match get_ns_inos(pid, nsname) {
             Some((i, p, o)) => (i, p, o),
@@ -273,18 +321,29 @@ fn read_process(entry: &DirEntry, pid: i32) -> Option<Process> {
         process.ns_oids[i] = oino;
     }
 
+    // Read command name from /proc/[pid]/cmdline (preferred) or /proc/[pid]/comm (fallback)
+    process.command = get_process_command(pid);
+
     // TODO: Get network namespace ID via netlink
     // if process.ns_ids[3] != 0 { // LSNS_TYPE_NET = 3
     //     process.netnsid = get_netnsid_for_process(pid, process.ns_ids[3])?;
     // }
-    // lsns.processes.push(process);
 
     // TODO: Read opened namespaces. Check read_opened_namespaces function in lsns.c
     Some(process)
 }
 
 fn read_namespaces(lsns: &mut Lsns) {
+    // Phase 2a: Read namespaces from running processes
     read_assigned_namespaces(lsns);
+
+    // Phase 2b: Read persistent namespaces (bind-mounted, may have 0 processes)
+    // This matches the C code: #ifdef USE_NS_GET_API read_persistent_namespaces(ls);
+    read_persistent_namespaces(lsns);
+
+    // Sort namespaces by inode number (NS column)
+    // This matches the C code: list_sort(&ls->namespaces, cmp_namespaces, NULL);
+    lsns.namespaces.sort_by_key(|ns| ns.id);
 }
 
 /// Read and organize namespaces from the processes we've collected
@@ -340,6 +399,8 @@ fn read_assigned_namespaces(lsns: &mut Lsns) {
                     ns_type: NamespaceType::from_index(ns_type_idx),
                     nprocs: 0, // Will increment as we add processes
                     netnsid,
+                    representative_pid: Some(process.pid), // Set initial representative
+                    uid_fallback: process.uid,             // Fallback UID if no process later
                 };
 
                 // Add to our namespace list
@@ -354,8 +415,131 @@ fn read_assigned_namespaces(lsns: &mut Lsns) {
 
             // Now increment the process count for this namespace
             lsns.namespaces[ns_idx].nprocs += 1;
+
+            // Update representative process (keep the lowest PID)
+            // This matches the C code: if (!ns->proc || ns->proc->pid > proc->pid)
+            let should_update = match lsns.namespaces[ns_idx].representative_pid {
+                None => true,                                   // No representative yet
+                Some(current_pid) => process.pid < current_pid, // New process has lower PID
+            };
+
+            if should_update {
+                lsns.namespaces[ns_idx].representative_pid = Some(process.pid);
+            }
         }
     }
+}
+
+/// Read namespaces that are bind-mounted to the filesystem (persistent namespaces)
+///
+/// These are namespaces that are kept alive by bind mounts rather than processes.
+/// Example: namespaces created with `ip netns add` are stored in /var/run/netns/
+///
+/// This function:
+/// 1. Reads the mount table (/proc/self/mountinfo)
+/// 2. Finds all mounts of type "nsfs" (namespace filesystem)
+/// 3. Extracts the namespace inode from the mount root
+/// 4. Adds any new namespaces not already discovered from processes
+fn read_persistent_namespaces(lsns: &mut Lsns) {
+    // Read the mount table from /proc/self/mountinfo
+    let mountinfo = match fs::read_to_string("/proc/self/mountinfo") {
+        Ok(content) => content,
+        Err(e) => {
+            eprintln!("DEBUG: Could not read /proc/self/mountinfo: {}", e);
+            return; // Not fatal - just skip persistent namespaces
+        }
+    };
+
+    // Parse each line of the mount table
+    for line in mountinfo.lines() {
+        // Mount table format (simplified):
+        // 24 0 0:21 net:[4026531992] /var/run/netns/test rw - nsfs nsfs rw
+        //                ^^^^^^^^^^^^^                                ^^^^^
+        //                mount root                              filesystem type
+
+        let parts: Vec<&str> = line.split_whitespace().collect();
+
+        // We need at least 9 fields to parse properly
+        if parts.len() < 9 {
+            continue;
+        }
+
+        // Check if this is an nsfs mount
+        // The filesystem type is after the "-" separator
+        let separator_idx = parts.iter().position(|&x| x == "-");
+        if separator_idx.is_none() {
+            continue;
+        }
+        let fstype_idx = separator_idx.unwrap() + 1;
+        if fstype_idx >= parts.len() || parts[fstype_idx] != "nsfs" {
+            continue;
+        }
+
+        // Extract the mount root (field 3, format: "net:[4026531992]")
+        let mount_root = parts[3];
+
+        // Parse the namespace inode from the root
+        // Format: "type:[inode]"
+        let ns_inode = match parse_namespace_inode(mount_root) {
+            Some(ino) => ino,
+            None => continue, // Invalid format, skip
+        };
+
+        // Check if we already know about this namespace
+        if namespace_exists(lsns, ns_inode) {
+            continue;
+        }
+
+        // Get the mount point (field 4)
+        let _mount_point = parts[4];
+
+        // Extract namespace type from mount_root (format: "type:[inode]")
+        // e.g., "net:[4026531992]" -> "net"
+        let ns_type_str = mount_root.split(':').next().unwrap_or("");
+
+        // Find the namespace type index
+        let ns_type_idx = NSNAMES.iter().position(|&name| name == ns_type_str);
+
+        if ns_type_idx.is_none() {
+            continue; // Unknown namespace type
+        }
+        let ns_type_idx = ns_type_idx.unwrap();
+
+        // Create a minimal namespace entry for persistent namespaces
+        // These namespaces have no processes (nprocs = 0) and no representative
+        let namespace = Namespace {
+            id: ns_inode as u32,
+            ns_type: NamespaceType::from_index(ns_type_idx),
+            nprocs: 0, // Persistent namespace - no processes
+            netnsid: LSNS_NETNS_UNUSABLE,
+            representative_pid: None, // No representative process
+            uid_fallback: 0,          // Default to root (UID 0) for persistent namespaces
+        };
+
+        lsns.namespaces.push(namespace);
+    }
+}
+
+/// Parse namespace inode from mount root string
+///
+/// Input format: "net:[4026531992]"
+/// Returns: Some(4026531992) or None if invalid
+fn parse_namespace_inode(mount_root: &str) -> Option<u64> {
+    // Find the opening bracket
+    let start = mount_root.find('[')?;
+    // Find the closing bracket
+    let end = mount_root.find(']')?;
+
+    // Extract the number between brackets
+    let inode_str = &mount_root[start + 1..end];
+
+    // Parse to u64
+    inode_str.parse::<u64>().ok()
+}
+
+/// Check if a namespace with this inode already exists
+fn namespace_exists(lsns: &Lsns, ns_inode: u64) -> bool {
+    lsns.namespaces.iter().any(|ns| ns.id as u64 == ns_inode)
 }
 
 /// Helper to convert namespace type index to enum
@@ -373,6 +557,80 @@ impl NamespaceType {
             _ => panic!("Invalid namespace type index: {}", idx),
         }
     }
+}
+
+/// Display namespaces in default format
+///
+/// Default columns: NS, TYPE, NPROCS, PID, USER, COMMAND
+/// Exact column positions matching original lsns:
+/// - NS: positions 1-10 (right-aligned)
+/// - TYPE: positions 12-17 (left-aligned, 6 chars to fit "cgroup")
+/// - NPROCS: positions 20-24 (right-aligned, 5 chars)
+/// - PID: positions 26-29 (right-aligned, 4 chars)
+/// - USER: positions 31-40 (left-aligned, 10 chars)
+/// - COMMAND: position 42+ (left-aligned, variable)
+fn display_namespaces(lsns: &Lsns) {
+    // Print header
+    // Format: NS(10) space TYPE(6) space NPROCS(5) 2spaces PID(4) space USER(10) space COMMAND
+    println!(
+        "{:>10} {:<6} {:>6}  {:>4} {:<10} {}",
+        "NS", "TYPE", "NPROCS", "PID", "USER", "COMMAND"
+    );
+
+    // Print each namespace
+    for ns in &lsns.namespaces {
+        // Get namespace type name
+        let ns_type = NSNAMES[ns.ns_type as usize];
+
+        // Find representative process
+        let rep_pid = ns.representative_pid.unwrap_or(0);
+        let rep_proc = lsns.processes.iter().find(|p| p.pid == rep_pid);
+
+        // Get user name
+        // If we have a process, use its UID. Otherwise use the namespace's fallback UID
+        let uid = if let Some(proc) = rep_proc {
+            proc.uid
+        } else {
+            ns.uid_fallback
+        };
+        let user = get_username(uid).unwrap_or_else(|| uid.to_string());
+
+        // Get command (empty for namespaces without processes)
+        let command = rep_proc.map(|p| p.command.as_str()).unwrap_or("");
+
+        // Print the row
+        // For PID column: show the PID if we have one, otherwise leave it empty (spaces)
+        if rep_pid > 0 {
+            println!(
+                "{:>10} {:<6} {:>6}  {:>4} {:<10} {}",
+                ns.id, ns_type, ns.nprocs, rep_pid, user, command
+            );
+        } else {
+            // Persistent namespace with no processes - leave PID column empty
+            println!(
+                "{:>10} {:<6} {:>6}  {:>4} {:<10} {}",
+                ns.id, ns_type, ns.nprocs, "", user, command
+            );
+        }
+    }
+}
+
+/// Get username from UID by reading /etc/passwd
+///
+/// Returns None if the user is not found
+fn get_username(uid: u32) -> Option<String> {
+    let passwd = fs::read_to_string("/etc/passwd").ok()?;
+    for line in passwd.lines() {
+        let parts: Vec<&str> = line.split(':').collect();
+        if parts.len() >= 3 {
+            if let Ok(line_uid) = parts[2].parse::<u32>() {
+                if line_uid == uid {
+                    return Some(parts[0].to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
