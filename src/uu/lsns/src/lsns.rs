@@ -2,14 +2,14 @@
 //
 // For the full copyright and license information, please view the LICENSE
 // file that was distributed with this source code.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 use std::fs::DirEntry;
 
 use clap::{crate_version, Command};
 use std::fs;
-use std::io;
+#[cfg(target_os = "linux")]
 use std::os::linux::fs::MetadataExt;
-use std::os::unix::io::AsRawFd;
 use uucore::{error::UResult, format_usage, help_about, help_usage};
 
 const ABOUT: &str = help_about!("lsns.md");
@@ -94,6 +94,7 @@ struct Lsns {
     namespaces: Vec<Namespace>,
 }
 
+#[cfg(target_os = "linux")]
 #[uucore::main]
 pub fn uumain(args: impl uucore::Args) -> UResult<()> {
     let _matches = uu_app().try_get_matches_from(args)?;
@@ -198,6 +199,7 @@ fn parse_process_stat(stat: &str) -> Option<(u32, char, u32)> {
     Some((pid, state, ppid))
 }
 
+#[cfg(target_os = "linux")]
 fn get_uid_from_entry(entry: &DirEntry) -> Option<u32> {
     let f = entry.metadata().ok()?;
     let uid = f.st_uid();
@@ -239,6 +241,7 @@ fn get_pid_from_entry(entry: &DirEntry) -> Option<u64> {
 /// - ino: The namespace's own inode
 /// - pino: Parent namespace inode (for hierarchical namespaces)
 /// - oino: Owner user namespace inode
+#[cfg(target_os = "linux")]
 fn get_ns_inos(pid: u32, nsname: &str) -> Option<(u64, u64, u64)> {
     let ns_path = format!("/proc/{}/ns/{}", pid, nsname);
 
